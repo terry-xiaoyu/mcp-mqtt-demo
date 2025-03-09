@@ -2,6 +2,7 @@ import json
 import random
 import time
 import threading
+import sys
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import MQTTErrorCode
 from enum import Enum
@@ -29,18 +30,15 @@ global_mqtt_clients = []
 ################################################################################
 def run_mcp_server(server_name, version, num_workers = 4, ping_interval=30,
                    host="localhost", port=1883, username=None, password=None):
-    global global_server_info
-    global_server_info = {"name": server_name, "version": version}
-    connect("server", num_workers, ping_interval, host, port, username, password)
+    connect("server", server_name, num_workers, ping_interval, host, port, username, password)
+    send_ping_message(pick_mqtt_client_randomly())
     start_ping_timer(ping_interval)
 
 def run_mcp_client(client_name, version, num_workers = 1, ping_interval=30,
                    host="localhost", port=1883, username=None, password=None):
-    global global_client_info
-    global_client_info = {"name": client_name, "version": version}
-    connect("client", num_workers, ping_interval, host, port, username, password)
+    connect("client", client_name, num_workers, ping_interval, host, port, username, password)
 
-def connect(mcp_role, num_workers, ping_interval=30,
+def connect(mcp_role, name, num_workers, ping_interval=30,
             host="localhost", port=1883, username=None, password=None):
     if mcp_role != "server" and mcp_role != "client":
         raise ValueError("Invalid MCP role")
@@ -51,18 +49,18 @@ def connect(mcp_role, num_workers, ping_interval=30,
 
     for worker_id in range(num_workers):
         if mcp_role == "client":
-            clientid = client_clientid(global_client_info["name"], worker_id)
+            clientid = client_clientid(name, worker_id)
         elif mcp_role == "server":
-            clientid = server_clientid(global_server_info["name"], worker_id)
-        userdata = {"mcp_role": mcp_role, "worker_id": worker_id,
-                    "num_workers": num_workers, "ping_interval": ping_interval},
+            clientid = server_clientid(name, worker_id)
+        userdata = {"mcp_role": mcp_role, "name": name, "worker_id": worker_id,
+                    "num_workers": num_workers, "ping_interval": ping_interval}
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id = clientid,
                              userdata = userdata)
         client.username_pw_set(username, password)
         client.on_message = on_message
         client.on_connect = on_connect
         res = client.connect(host = MQTT_BROKER, port = MQTT_PORT,
-                             keepalive = ping_interval * 2)
+                             keepalive = ping_interval)
         if res != MQTTErrorCode.MQTT_ERR_SUCCESS:
             raise ConnectionError(f"Failed to connect to MQTT Broker: {res}")
         print(f"Connected to MQTT Broker, clientid: {clientid}")
@@ -103,13 +101,13 @@ def json_notification_msg(method, params):
 
 def server_rpc_topic_filter(server_name, suffix=None):
     if suffix is None:
-        return f"$share/g/$mcp/server/{server_name}"
-    return f"$share/g/$mcp/server/{server_name}/{suffix}"
+        return f"$share/g/$mcp/server_rpc/{server_name}"
+    return f"$share/g/$mcp/server_rpc/{server_name}/{suffix}"
 
 def server_rpc_topic(server_name, suffix=None):
     if suffix is None:
-        return f"$mcp/server/{server_name}"
-    return f"$mcp/server/{server_name}/{suffix}"
+        return f"$mcp/server_rpc/{server_name}"
+    return f"$mcp/server_rpc/{server_name}/{suffix}"
 
 def server_capability_topic_filter(server_name, capability):
     return f"$mcp/server/{server_name}/capability/{capability}"
@@ -119,11 +117,13 @@ def server_ping_topic(server_name):
 
 def client_rpc_topic_filter(client_name, suffix=None):
     if suffix is None:
-        return f"$share/g/$mcp/client/{client_name}"
-    return f"$share/g/$mcp/client/{client_name}/{suffix}"
+        return f"$share/g/$mcp/client_rpc/{client_name}"
+    return f"$share/g/$mcp/client_rpc/{client_name}/{suffix}"
 
-def client_rpc_topic(client_name):
-    return f"$mcp/client/{client_name}"
+def client_rpc_topic(client_name, suffix=None):
+    if suffix is None:
+        return f"$mcp/client_rpc/{client_name}"
+    return f"$mcp/client_rpc/{client_name}/{suffix}"
 
 def client_capability_topic_filter(client_name, capability):
     return f"$mcp/client/{client_name}/capability/{capability}"
@@ -137,12 +137,32 @@ def client_clientid(client_name, worker_id):
 ################################################################################
 ## MCP Helper Functions
 ################################################################################
-def get_clientid_from_rpc_topic(topic_words):
-    # skip the first 2 parts of the topic
-    clientid = topic_words[2:]
-    if len(clientid) == 0:
-        return None
-    return clientid.join('/')
+def get_client_name_from_rpc_topic(topic_words):
+    # The topic is: $mcp/server_rpc/<server_name>/<clientid_of_mcp_client>
+    #  where <clientid_of_mcp_client> is $mcp/client/<client_name>/<worker_id>
+    try:
+        return topic_words[5]
+    except IndexError:
+        print(f"get client name failed, invalid topic: {topic_words}")
+        raise
+
+def get_server_name_from_rpc_topic(topic_words):
+    ## The topic should be $mcp/client_rpc/<client_name>/$mcp/server/<server_name>/<worker_id>
+    try:
+        return topic_words[5]
+    except IndexError:
+        print(f"get server name failed, invalid topic: {topic_words}")
+        raise
+
+def get_server_clientid(userdata):
+    server_name = userdata["name"]
+    server_worker_id = userdata["worker_id"]
+    return server_clientid(server_name, server_worker_id)
+
+def get_client_clientid(userdata):
+    client_name = userdata["name"]
+    client_worker_id = userdata["worker_id"]
+    return client_clientid(client_name, client_worker_id)
 
 def send_mqtt_json_rpc(client, topic, method, params, request_id):
     json_rpc_message = json_rpc_msg(method, params, request_id)
@@ -159,19 +179,21 @@ def send_mqtt_json_rpc_response(client, topic, result_or_error, request_id):
     client.publish(topic, payload)
     print(f"Sent: {payload}")
 
-def handle_rpc_message_as_server(client, msg, topic_words):
-    client_name = #get_clientid_from_rpc_topic(topic_words)
+def handle_rpc_message_as_server(client, msg, topic_words, userdata):
+    client_name = get_client_name_from_rpc_topic(topic_words)
     data = json.loads(msg.payload)
     if "method" in data:
         method = data["method"]
         if method == "initialize":
-            handle_initialize_rpc(client, client_name, data["id"], data["params"])
+            s_clientid = get_server_clientid(userdata)
+            handle_initialize_rpc(client, client_name, data["id"], data["params"], s_clientid)
         else:
             print(f"Unknown method: {method}")
     else:
-        print("Invalid RPC message")
+        print("Invalid RPC message, method is missing")
 
-def handle_initialize_rpc(client, client_name, request_id, params):
+def handle_initialize_rpc(client, client_name, request_id, params, server_clientid):
+    topic = client_rpc_topic(client_name, server_clientid)
     print(f"Received initialize RPC message: {params}")
     if "protocolVersion" in params:
         protocol_version = params["protocolVersion"]
@@ -184,8 +206,8 @@ def handle_initialize_rpc(client, client_name, request_id, params):
                     "requested": protocol_version
                 }
             }
-            send_mqtt_json_rpc_response(client, client_rpc_topic(client_name),
-                                      ("error", error_info), request_id)
+            send_mqtt_json_rpc_response(client, topic, ("error", error_info),
+                                        request_id)
             return
         if "capabilities" in params:
             capabilities = params["capabilities"]
@@ -196,12 +218,8 @@ def handle_initialize_rpc(client, client_name, request_id, params):
                 "capabilities": global_server_capabilities,
                 "serverInfo": global_server_info
             }
-            ## subscribe to the capability topics if the capabilities is "listChanged: true"
-            for cap in capabilities:
-                if "listChanged" in capabilities[cap] and capabilities[cap]["listChanged"]:
-                    client.subscribe(client_capability_topic_filter(client_name, cap))
-            send_mqtt_json_rpc_response(client, client_rpc_topic(client_name),
-                                      ("ok", initialize_result), request_id)
+            send_mqtt_json_rpc_response(client, topic, ("ok", initialize_result),
+                                        request_id)
     else:
         error_info = {
             "code": ErrorCode.INVALID_PARAMS.value,
@@ -211,80 +229,140 @@ def handle_initialize_rpc(client, client_name, request_id, params):
                 "requested": None
             }
         }
-        send_mqtt_json_rpc_response(client, client_rpc_topic(client_name),
-                                  ("error", error_info), request_id)
+        send_mqtt_json_rpc_response(client, topic, ("error", error_info), request_id)
 
 
-def handle_capability_message_as_server(client, msg, topic_words):
+def handle_capability_message_as_server(client, msg, topic_words, userdata):
     print(f"Received capability message: {msg.payload}")
 
 def start_ping_timer(ping_interval):
     timer = threading.Timer(ping_interval, on_ping_timer)
     timer.start()
 
+def send_initialize_rpc(server_name):
+    client = pick_mqtt_client_randomly()
+    userdata = client.user_data_get()
+    c_clientid = get_client_clientid(userdata)
+    topic = server_rpc_topic(server_name, c_clientid)
+    print(f"Sending initialize RPC as {c_clientid}, to {topic}")
+    initialize_params = {"protocolVersion": PROTOCOL_VERSION,
+                         "capabilities": global_client_capabilities,
+                         "clientInfo": global_client_info
+                         }
+    send_mqtt_json_rpc(client, topic, 
+                       "initialize", initialize_params, 1)
+
+def send_ping_message(client):
+    ping_message = json_notification_msg("ping", {"timestamp": now_ms()})
+    server_name = client.user_data_get()["name"]
+    client.publish(topic = server_ping_topic(server_name), 
+                   payload = json.dumps(ping_message), retain = True)
+
+def pick_mqtt_client_randomly():
+    num_workers = len(global_mqtt_clients)
+    worker_id = random.randint(0, num_workers - 1)
+    return global_mqtt_clients[worker_id]
+
+def now_ms():
+    return int(time.time() * 1000)
+
 ################################################################################
 ## MQTT Callbacks
 ################################################################################
 def on_ping_timer():
     client = pick_mqtt_client_randomly()
-    client.publish(server_ping_topic(global_server_info["name"]), "ping")
+    userdata = client.user_data_get()
+    send_ping_message(client)
+    start_ping_timer(userdata["ping_interval"])
 
 def on_message(client, userdata, msg):
     print(f"Received: {msg.payload}")
     topic_words = msg.topic.split('/')
-    if userdata[0]["mcp_role"] == "server":
+    if userdata["mcp_role"] == "server":
         handle_message_as_server(client, msg, topic_words, userdata)
-    elif userdata[0]["mcp_role"] == "client":
+    elif userdata["mcp_role"] == "client":
         handle_message_as_client(client, msg, topic_words, userdata)
 
 def on_connect(client, userdata, flags, reason_code, properties):
     print(f"Connected with result code {reason_code}")
-    if userdata[0]["mcp_role"] == "server":
-        client.subscribe(server_rpc_topic_filter(global_server_info["name"], "#"))
+    if userdata["mcp_role"] == "server":
+        server_name = userdata["name"]
+        client.subscribe(server_rpc_topic_filter(server_name, "#"))
         client.subscribe(client_capability_topic_filter("+", "#"))
-    elif userdata[0]["mcp_role"] == "client":
-        client.subscribe(client_rpc_topic_filter(global_client_info["name"], "#"))
+    elif userdata["mcp_role"] == "client":
+        client_name = userdata["name"]
+        client.subscribe(client_rpc_topic_filter(client_name, "#"))
         client.subscribe(server_capability_topic_filter("+", "#"))
+        client.subscribe(server_ping_topic("+"))
 
 def handle_message_as_server(client, msg, topic_words, userdata):
     ## Check if it is a RPC message or a client capability message
-    ##  - Topic of RPC messages: $mcp/server/<server-name>/<clientid>
-    ##  - Topic of capability messages: $mcp/client/<client-id>/capability/<capability>
+    ##  - Topic of RPC messages: $mcp/server_rpc/<server_name>/<clientid_of_mcp_client>
+    ##  - Topic of client capability messages: $mcp/client/<client_name>/capability/<capability>
     if topic_words[0] != "$mcp":
-        return
-    if topic_words[1] == "server":
-        handle_rpc_message_as_server(client, msg, topic_words)
+        print(f"Unknown topic {msg.topic}")
+        return None
+    if topic_words[1] == "server_rpc":
+        handle_rpc_message_as_server(client, msg, topic_words, userdata)
     elif topic_words[1] == "client":
-        handle_capability_message_as_server(client, msg, topic_words)
+        handle_capability_message_as_server(client, msg, topic_words, userdata)
+    else:
+        print(f"Unknown topic {msg.topic}")
+        return None
 
 def handle_message_as_client(client, msg, topic_words, userdata):
+    ## Check the message type by the topic
+    ##  - Topic of RPC messages: $mcp/client_rpc/<client_name>/<clientid_of_mcp_server>
+    ##  - Topic of server capability messages: $mcp/server/<server_name>/capability/<capability>
+    ##  - Topic of server ping messages: $mcp/server/<server_name>/ping
     if topic_words[0] != "$mcp":
+        print(f"Unknown topic {msg.topic}")
         return
-    if topic_words[1] == "client":
+    if topic_words[1] == "client_rpc":
         handle_rpc_message_as_client(client, msg, topic_words)
     elif topic_words[1] == "server":
-        handle_capability_message_as_client(client, msg, topic_words)
+        if topic_words[-1] == "ping":
+            handle_ping_message_as_client(client, msg, topic_words)
+        else:
+            handle_capability_message_as_client(client, msg, topic_words)
+    else:
+        print(f"Unknown topic {msg.topic}")
+        return None
 
-def send_initialize_rpc():
-    client = pick_mqtt_client_randomly()
-    initialize_params = {"protocolVersion": PROTOCOL_VERSION,
-                         "capabilities": global_client_capabilities,
-                         "clientInfo": global_client_info
-                         }
-    send_mqtt_json_rpc(client, server_rpc_topic(client_name, worker_id), 
-                       "initialize", initialize_params, 1)
+def handle_rpc_message_as_client(client, msg, topic_words):
+    payload = json.loads(msg.payload)
+    print(f"Handling RPC message: {payload}")
+    server_name = get_server_name_from_rpc_topic(topic_words)
+    global_server_capabilities[server_name] = payload["result"]["capabilities"]
+    global_server_info[server_name] = payload["result"]["serverInfo"]
 
-def pick_mqtt_client_randomly():
-    num_workers = len(global_mqtt_clients)
-    worker_id = random.randint(0, num_workers - 1)
-    client_name = global_client_info["name"]
-    client = global_mqtt_clients[worker_id]
+def handle_ping_message_as_client(client, msg, topic_words):
+    print(f"Received ping message: {msg.payload}")
+    server_name = topic_words[2]
+    if global_server_capabilities.get(server_name) is None:
+        payload = json.loads(msg.payload)
+        timestamp = payload["params"]["timestamp"]
+        ## check if the timestamp is within the last 30 seconds
+        if now_ms() - timestamp <= 30000:
+            send_initialize_rpc(server_name)
+
+def handle_capability_message_as_client(client, msg, topic_words):
+    print(f"Received capability message: {msg.payload}")
 
 ################################################################################
 ## Main
 ################################################################################    
 if __name__ == "__main__":
-    run_mcp_server("ssh_tool", "0.1.0")
-    ## sleep 1s
-    time.sleep(1)
-    run_mcp_client("mcp_over_mqtt", "0.1.0")
+    arg = sys.argv[1]
+    if arg == "client":
+        run_mcp_client("ssh_tool", "0.1.0")
+    elif arg == "server":
+        run_mcp_server("mcp_over_mqtt", "0.1.0")
+    else:
+        print(f"Invalid argument: {arg}")
+        print("Usage: python mcp_over_mqtt.py client|server")
+        sys.exit(1)
+
+    while True:
+        time.sleep(100)
+        pass
