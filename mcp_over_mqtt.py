@@ -1,10 +1,11 @@
+import base64
 import json
 import random
 import time
 import threading
 import sys
 import paho.mqtt.client as mqtt
-from paho.mqtt.enums import MQTTErrorCode
+from paho.mqtt.enums import MQTTErrorCode, MQTTProtocolVersion
 from enum import Enum
 
 MQTT_BROKER = "localhost"
@@ -25,18 +26,46 @@ global_server_info = {}
 
 global_mqtt_clients = []
 
+server_tool_callbacks = {}
+
+################ TODO
+# 1. Client also sends ping message to server, and server sends initialize message to client
+# 2. Notify the client when server disconnects
+
 ################################################################################
 ## APIs
 ################################################################################
 def run_mcp_server(server_name, version, num_workers = 4, ping_interval=30,
-                   host="localhost", port=1883, username=None, password=None):
+                   host="localhost", port=1883, username=None, password=None,
+                   capabilities=[], tool_callbacks=[]):
+    global global_server_capabilities
+    global global_server_info
+    global server_tool_callbacks
     connect("server", server_name, num_workers, ping_interval, host, port, username, password)
+    global_server_capabilities[server_name] = capabilities
+    global_server_info[server_name] = {"name": server_name, "version": version}
+    server_tool_callbacks = tool_callbacks
     send_ping_message(pick_mqtt_client_randomly())
     start_ping_timer(ping_interval)
 
 def run_mcp_client(client_name, version, num_workers = 1, ping_interval=30,
-                   host="localhost", port=1883, username=None, password=None):
+                   host="localhost", port=1883, username=None, password=None,
+                   capabilities=[]):
+    global global_client_capabilities
+    global global_client_info
     connect("client", client_name, num_workers, ping_interval, host, port, username, password)
+    global_client_capabilities[client_name] = capabilities
+    global_client_info[client_name] = {"name": client_name, "version": version}
+    send_ping_message(pick_mqtt_client_randomly())
+
+def send_tools_call_rpc(server_name, tool_name, params):
+    client = pick_mqtt_client_randomly()
+    userdata = client.user_data_get()
+    c_clientid = get_client_clientid(userdata)
+    topic = server_rpc_topic(server_name, c_clientid)
+    print(f"Sending tools/call RPC as {c_clientid}, to {topic}")
+    tools_call_params = {"name": tool_name, "arguments": params}
+    send_mqtt_json_rpc(client, topic, "tools/call", tools_call_params, 1)
 
 def connect(mcp_role, name, num_workers, ping_interval=30,
             host="localhost", port=1883, username=None, password=None):
@@ -55,7 +84,7 @@ def connect(mcp_role, name, num_workers, ping_interval=30,
         userdata = {"mcp_role": mcp_role, "name": name, "worker_id": worker_id,
                     "num_workers": num_workers, "ping_interval": ping_interval}
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id = clientid,
-                             userdata = userdata)
+                             userdata = userdata, protocol = MQTTProtocolVersion.MQTTv5)
         client.username_pw_set(username, password)
         client.on_message = on_message
         client.on_connect = on_connect
@@ -128,6 +157,9 @@ def client_rpc_topic(client_name, suffix=None):
 def client_capability_topic_filter(client_name, capability):
     return f"$mcp/client/{client_name}/capability/{capability}"
 
+def client_ping_topic(client_name):
+    return f"$mcp/client/{client_name}/ping"
+
 def server_clientid(server_name, worker_id):
     return f"$mcp/server/{server_name}/{worker_id}"
 
@@ -181,14 +213,18 @@ def send_mqtt_json_rpc_response(client, topic, result_or_error, request_id):
 
 def handle_rpc_message_as_server(client, msg, topic_words, userdata):
     client_name = get_client_name_from_rpc_topic(topic_words)
+    server_clientid = get_server_clientid(userdata)
     data = json.loads(msg.payload)
     if "method" in data:
         method = data["method"]
         if method == "initialize":
-            s_clientid = get_server_clientid(userdata)
-            handle_initialize_rpc(client, client_name, data["id"], data["params"], s_clientid)
+            handle_initialize_rpc(client, client_name, data["id"],
+                                  data["params"], server_clientid)
+        elif method == "tools/call":
+            handle_tools_call_rpc(client, client_name, data["id"],
+                                  data["params"], server_clientid)
         else:
-            print(f"Unknown method: {method}")
+            print(f"Unsupported method: {method}")
     else:
         print("Invalid RPC message, method is missing")
 
@@ -231,6 +267,44 @@ def handle_initialize_rpc(client, client_name, request_id, params, server_client
         }
         send_mqtt_json_rpc_response(client, topic, ("error", error_info), request_id)
 
+def handle_tools_call_rpc(client, client_name, request_id, params, server_clientid):
+    topic = client_rpc_topic(client_name, server_clientid)
+    print(f"Received tools/call RPC message: {params}")
+    if "name" in params:
+        func_name = params["name"]
+        if func_name in server_tool_callbacks:
+            func = server_tool_callbacks[func_name]
+            if "params" in params:
+                tool_params = params["params"]
+                result = call_tools(request_id, func, *tool_params)
+                send_mqtt_json_rpc_response(client, topic, result, request_id)
+            else:
+                error_info = {
+                    "code": ErrorCode.INVALID_PARAMS.value,
+                    "message": "params is required",
+                    "data": {
+                        "tool": func_name
+                    }
+                }
+                send_mqtt_json_rpc_response(client, topic, ("error", error_info), request_id)
+        else:
+            error_info = {
+                "code": ErrorCode.METHOD_NOT_FOUND.value,
+                "message": "Tool not found",
+                "data": {
+                    "tool": func_name
+                }
+            }
+            send_mqtt_json_rpc_response(client, topic, ("error", error_info), request_id)
+    else:
+        error_info = {
+            "code": ErrorCode.INVALID_PARAMS.value,
+            "message": "Tool name is required",
+            "data": {
+                "tool": None
+            }
+        }
+        send_mqtt_json_rpc_response(client, topic, ("error", error_info), request_id)
 
 def handle_capability_message_as_server(client, msg, topic_words, userdata):
     print(f"Received capability message: {msg.payload}")
@@ -254,9 +328,12 @@ def send_initialize_rpc(server_name):
 
 def send_ping_message(client):
     ping_message = json_notification_msg("ping", {"timestamp": now_ms()})
-    server_name = client.user_data_get()["name"]
-    client.publish(topic = server_ping_topic(server_name), 
-                   payload = json.dumps(ping_message), retain = True)
+    name = client.user_data_get()["name"]
+    if client.user_data_get()["mcp_role"] == "server":
+        topic = server_ping_topic(name)
+    else:
+        topic = client_ping_topic(name)
+    client.publish(topic = topic, payload = json.dumps(ping_message), retain = True)
 
 def pick_mqtt_client_randomly():
     num_workers = len(global_mqtt_clients)
@@ -265,6 +342,51 @@ def pick_mqtt_client_randomly():
 
 def now_ms():
     return int(time.time() * 1000)
+
+def call_tools(request_id, func, *args, **kwargs):
+    ## call the function and return error if it crashes
+    try:
+        result = func(*args, **kwargs)
+        return json_rpc_result_msg({"content": format_result(result)}, request_id)
+    except Exception as e:
+        result = {"content": [error_result(str(e))], "isError": True}
+        return json_rpc_result_msg(result, request_id)
+
+def format_result(result):
+    if isinstance(result, list):
+        return [do_format_result(r) for r in result]
+    else:
+        return [do_format_result(result)]
+
+def do_format_result(result):
+    if isinstance(result, str):
+        return text_result()
+    elif isinstance(result, dict):
+        return json_result(result)
+    elif isinstance(result, tuple):
+        res_type, result = result
+        if res_type == "text":
+            return text_result(result)
+        elif res_type == "json":
+            return json_result(result)
+        elif res_type == "image":
+            return image_result(result)
+    else:
+        return error_result(f"Invalid result type: {type(result)}")
+
+def text_result(result):
+    return {"type": "text", "text": result}
+
+def json_result(result):
+    return {"type": "text", "text": json.dumps(result)}
+
+def image_result(result):
+    ## base64 encode the image
+    return {"type": "image", "data": base64.b64encode(result["data"]).decode(),
+            "mimeType": result["mimeType"]}
+
+def error_result(error_msg):
+    {"type": "text", "text": error_msg}
 
 ################################################################################
 ## MQTT Callbacks
@@ -330,6 +452,8 @@ def handle_message_as_client(client, msg, topic_words, userdata):
         return None
 
 def handle_rpc_message_as_client(client, msg, topic_words):
+    global global_server_capabilities
+    global global_server_info
     payload = json.loads(msg.payload)
     print(f"Handling RPC message: {payload}")
     server_name = get_server_name_from_rpc_topic(topic_words)

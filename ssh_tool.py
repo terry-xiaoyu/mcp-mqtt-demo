@@ -1,6 +1,9 @@
 import paramiko
-import os
+import os, time
 import mcp_over_mqtt as mcp
+
+SERVER_NAME = "ssh_tool"
+VERSION = "0.1.0"
 
 def ssh_execute_command(host, port, username, password, command):
     """
@@ -48,39 +51,43 @@ if __name__ == "__main__":
     # command = "ls -l"
     # result = ssh_execute_command(host, port, username, password, command)
     # print(result)
-    mcp.global_server_capabilities["tools"] = {
-        "listChanged": True,
-        "list": [
-            {
-                "name": "ssh",
-                "description": "Execute command on remote server via SSH",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "host": {
-                            "type": "string",
-                            "description": "Remote server IP or domain name"
-                        },
-                        "port": {
-                            "type": "integer",
-                            "description": "SSH port number"
-                        },
-                        "username": {
-                            "type": "string",
-                            "description": "SSH login username"
-                        },
-                        "password": {
-                            "type": "string",
-                            "description": "SSH login password"
-                        },
-                        "command": {
-                            "type": "string",
-                            "description": "Command to execute"
-                        }
+    supported_tools = [
+        {
+            "name": "ssh",
+            "description": "Execute command on remote server via SSH",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": "Remote server IP or domain name"
                     },
-                    "required": ["host", "username", "password", "command"]
-                }
+                    "port": {
+                        "type": "integer",
+                        "description": "SSH port number"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "SSH login username"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "SSH login password"
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Command to execute"
+                    }
+                },
+                "required": ["host", "username", "password", "command"]
             }
-        ]
+        }
+    ]
+    server_capabilities = {
+        "tools": supported_tools
     }
-    mcp.run_mcp_server("ssh_tool")
+    mcp.run_mcp_server(SERVER_NAME, VERSION, capabilities=server_capabilities,
+                       tool_callbacks={"ssh_execute_command": ssh_execute_command})
+    while True:
+        time.sleep(100)
+        pass
