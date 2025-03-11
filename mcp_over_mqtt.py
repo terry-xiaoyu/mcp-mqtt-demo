@@ -1,9 +1,11 @@
 import base64
+import copy
 import json
 import random
 import time
 import threading
 import sys
+import asyncio
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import MQTTErrorCode, MQTTProtocolVersion
 from enum import Enum
@@ -11,6 +13,9 @@ from enum import Enum
 MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
 PROTOCOL_VERSION = "0.1.0"
+
+METHOD_INIT = "initialize"
+METHOD_FUNC_CALL = "tools/call"
 
 class ErrorCode(Enum):
     PARSE_ERROR = -32700
@@ -58,14 +63,29 @@ def run_mcp_client(client_name, version, num_workers = 1, ping_interval=30,
     global_client_info[client_name] = {"name": client_name, "version": version}
     send_ping_message(pick_mqtt_client_randomly())
 
-def send_tools_call_rpc(server_name, tool_name, params):
+def send_tools_call_rpc(server_name, tool_name, arguments):
     client = pick_mqtt_client_randomly()
     userdata = client.user_data_get()
     c_clientid = get_client_clientid(userdata)
     topic = server_rpc_topic(server_name, c_clientid)
-    print(f"Sending tools/call RPC as {c_clientid}, to {topic}")
-    tools_call_params = {"name": tool_name, "arguments": params}
-    send_mqtt_json_rpc(client, topic, "tools/call", tools_call_params, 1)
+    log_debug(f"Sending function call RPC as {c_clientid}, to {topic}")
+    tools_call_params = {"name": tool_name, "arguments": arguments}
+    return asyncio.run(send_mqtt_json_rpc_and_wait_reply(client, topic, METHOD_FUNC_CALL, tools_call_params))
+
+def get_avaliable_tools_open_ai():
+    ## Return tools from all the available server_names in the form of OpenAI
+    ## the global_server_capabilities is of the form {server_name: capabilities}
+    ## where the capabilities contains a list of tools in the form of {"tools": [tool1, tool2, ...]}
+    ## where tool1, tool2, ... are of the form {"name": "tool_name", "description": "tool_description", "parameters": {...}}
+    ## We need to convert it to [{"type": "function", "function": {"name": "server_name:tool_name", "description": "tool_description", "parameters": {...}}}]
+    ## Note that we also change the the "name" to "server_name:tool_name"
+    tools = []
+    for server_name, capabilities in global_server_capabilities.items():
+        for tool in capabilities.get("tools", []):
+            toolc = copy.deepcopy(tool)
+            toolc["name"] = f"{server_name}:{toolc['name']}"
+            tools.append({"type": "function", "function": toolc})
+    return tools
 
 def connect(mcp_role, name, num_workers, ping_interval=30,
             host="localhost", port=1883, username=None, password=None):
@@ -78,9 +98,9 @@ def connect(mcp_role, name, num_workers, ping_interval=30,
 
     for worker_id in range(num_workers):
         if mcp_role == "client":
-            clientid = client_clientid(name, worker_id)
+            clientid = mk_client_clientid(name, worker_id)
         elif mcp_role == "server":
-            clientid = server_clientid(name, worker_id)
+            clientid = mk_server_clientid(name, worker_id)
         userdata = {"mcp_role": mcp_role, "name": name, "worker_id": worker_id,
                     "num_workers": num_workers, "ping_interval": ping_interval}
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id = clientid,
@@ -92,7 +112,7 @@ def connect(mcp_role, name, num_workers, ping_interval=30,
                              keepalive = ping_interval)
         if res != MQTTErrorCode.MQTT_ERR_SUCCESS:
             raise ConnectionError(f"Failed to connect to MQTT Broker: {res}")
-        print(f"Connected to MQTT Broker, clientid: {clientid}")
+        log_debug(f"Connected to MQTT Broker, clientid: {clientid}")
         global_mqtt_clients.append(client)
         client.loop_start()
 
@@ -160,10 +180,10 @@ def client_capability_topic_filter(client_name, capability):
 def client_ping_topic(client_name):
     return f"$mcp/client/{client_name}/ping"
 
-def server_clientid(server_name, worker_id):
+def mk_server_clientid(server_name, worker_id):
     return f"$mcp/server/{server_name}/{worker_id}"
 
-def client_clientid(client_name, worker_id):
+def mk_client_clientid(client_name, worker_id):
     return f"$mcp/client/{client_name}/{worker_id}"
 
 ################################################################################
@@ -175,7 +195,7 @@ def get_client_name_from_rpc_topic(topic_words):
     try:
         return topic_words[5]
     except IndexError:
-        print(f"get client name failed, invalid topic: {topic_words}")
+        log_debug(f"get client name failed, invalid topic: {topic_words}")
         raise
 
 def get_server_name_from_rpc_topic(topic_words):
@@ -183,24 +203,60 @@ def get_server_name_from_rpc_topic(topic_words):
     try:
         return topic_words[5]
     except IndexError:
-        print(f"get server name failed, invalid topic: {topic_words}")
+        log_debug(f"get server name failed, invalid topic: {topic_words}")
         raise
 
 def get_server_clientid(userdata):
     server_name = userdata["name"]
     server_worker_id = userdata["worker_id"]
-    return server_clientid(server_name, server_worker_id)
+    return mk_server_clientid(server_name, server_worker_id)
 
 def get_client_clientid(userdata):
     client_name = userdata["name"]
     client_worker_id = userdata["worker_id"]
-    return client_clientid(client_name, client_worker_id)
+    return mk_client_clientid(client_name, client_worker_id)
 
-def send_mqtt_json_rpc(client, topic, method, params, request_id):
+def set_pending_request(client, request_id, pending_data):
+    userdata = client.user_data_get()
+    userdata.setdefault("pending_requests", {})[request_id] = pending_data
+    userdata["next_request_id"] = request_id + 1
+    client.user_data_set(userdata)
+
+def remove_pending_request(client, request_id):
+    userdata = client.user_data_get()
+    pending_requests = userdata.get("pending_requests", {})
+    if request_id in pending_requests:
+        del pending_requests[request_id]
+        client.user_data_set(userdata)
+
+def get_next_request_id(client):
+    userdata = client.user_data_get()
+    return userdata.get("next_request_id", 1)
+
+async def send_mqtt_json_rpc_and_wait_reply(client, topic, method, params, timeout=30):
+    loop = maybe_create_event_loop()
+    future = loop.create_future()
+    request_id = get_next_request_id(client)
     json_rpc_message = json_rpc_msg(method, params, request_id)
     payload = json.dumps(json_rpc_message)
     client.publish(topic, payload)
-    print(f"Sent: {payload}")
+    pending_data = {"message": json_rpc_message, "future": future}
+    set_pending_request(client, request_id, pending_data)
+    log_debug(f"Sent: {payload}")
+    try:
+        return await asyncio.wait_for(future, timeout=timeout)
+    except asyncio.TimeoutError:
+        log_debug(f"RPC timeout waiting for response")
+        return ("error", "Tool not responding within {timeout} seconds...")
+
+def send_mqtt_json_rpc(client, topic, method, params):
+    request_id = get_next_request_id(client)
+    json_rpc_message = json_rpc_msg(method, params, request_id)
+    payload = json.dumps(json_rpc_message)
+    client.publish(topic, payload)
+    pending_data = {"message": json_rpc_message, "future": None}
+    set_pending_request(client, request_id, pending_data)
+    log_debug(f"Sent: {payload}")
 
 def send_mqtt_json_rpc_response(client, topic, result_or_error, request_id):
     if result_or_error[0] == "ok":
@@ -209,28 +265,29 @@ def send_mqtt_json_rpc_response(client, topic, result_or_error, request_id):
         json_rpc_message = json_rpc_error_msg(result_or_error[1], request_id)
     payload = json.dumps(json_rpc_message)
     client.publish(topic, payload)
-    print(f"Sent: {payload}")
+    log_debug(f"Sent: {payload}")
 
 def handle_rpc_message_as_server(client, msg, topic_words, userdata):
-    client_name = get_client_name_from_rpc_topic(topic_words)
-    server_clientid = get_server_clientid(userdata)
+    client_name = get_client_name_from_rpc_topic(topic_words)    
     data = json.loads(msg.payload)
     if "method" in data:
         method = data["method"]
-        if method == "initialize":
-            handle_initialize_rpc(client, client_name, data["id"],
-                                  data["params"], server_clientid)
-        elif method == "tools/call":
-            handle_tools_call_rpc(client, client_name, data["id"],
-                                  data["params"], server_clientid)
+        if method == METHOD_INIT:
+            handle_initialize_rpc(client, client_name, userdata, data["id"],
+                                  data["params"])
+        elif method == METHOD_FUNC_CALL:
+            handle_tools_call_rpc(client, client_name, userdata, data["id"],
+                                  data["params"])
         else:
-            print(f"Unsupported method: {method}")
+            log_debug(f"Unsupported method: {method}")
     else:
-        print("Invalid RPC message, method is missing")
+        log_debug("Invalid RPC message, method is missing")
 
-def handle_initialize_rpc(client, client_name, request_id, params, server_clientid):
+def handle_initialize_rpc(client, client_name, userdata, request_id, params):
+    server_name = userdata["name"]
+    server_clientid = get_server_clientid(userdata)
     topic = client_rpc_topic(client_name, server_clientid)
-    print(f"Received initialize RPC message: {params}")
+    log_debug(f"Received initialize RPC message: {params}")
     if "protocolVersion" in params:
         protocol_version = params["protocolVersion"]
         if protocol_version != PROTOCOL_VERSION:
@@ -251,8 +308,8 @@ def handle_initialize_rpc(client, client_name, request_id, params, server_client
             global_client_capabilities[client_name] = capabilities
             initialize_result = {
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": global_server_capabilities,
-                "serverInfo": global_server_info
+                "capabilities": global_server_capabilities[server_name],
+                "serverInfo": global_server_info[server_name]
             }
             send_mqtt_json_rpc_response(client, topic, ("ok", initialize_result),
                                         request_id)
@@ -267,21 +324,23 @@ def handle_initialize_rpc(client, client_name, request_id, params, server_client
         }
         send_mqtt_json_rpc_response(client, topic, ("error", error_info), request_id)
 
-def handle_tools_call_rpc(client, client_name, request_id, params, server_clientid):
+def handle_tools_call_rpc(client, client_name, userdata, request_id, params):
+    server_clientid = get_server_clientid(userdata)
     topic = client_rpc_topic(client_name, server_clientid)
-    print(f"Received tools/call RPC message: {params}")
+    log_debug(f"Received tools/call RPC message: {params}")
     if "name" in params:
-        func_name = params["name"]
+        func_name = (params["name"]).split(":")[-1]
         if func_name in server_tool_callbacks:
             func = server_tool_callbacks[func_name]
-            if "params" in params:
-                tool_params = params["params"]
-                result = call_tools(request_id, func, *tool_params)
+            if "arguments" in params:
+                tool_args = maybe_decode_json(params["arguments"])
+                log_debug(f"---Calling tool: {func_name} with args: {tool_args}")
+                result = call_tools(func, **tool_args)
                 send_mqtt_json_rpc_response(client, topic, result, request_id)
             else:
                 error_info = {
                     "code": ErrorCode.INVALID_PARAMS.value,
-                    "message": "params is required",
+                    "message": "arguments is required",
                     "data": {
                         "tool": func_name
                     }
@@ -307,7 +366,7 @@ def handle_tools_call_rpc(client, client_name, request_id, params, server_client
         send_mqtt_json_rpc_response(client, topic, ("error", error_info), request_id)
 
 def handle_capability_message_as_server(client, msg, topic_words, userdata):
-    print(f"Received capability message: {msg.payload}")
+    log_debug(f"TODO: handle capability message: {msg.payload}")
 
 def start_ping_timer(ping_interval):
     timer = threading.Timer(ping_interval, on_ping_timer)
@@ -318,13 +377,12 @@ def send_initialize_rpc(server_name):
     userdata = client.user_data_get()
     c_clientid = get_client_clientid(userdata)
     topic = server_rpc_topic(server_name, c_clientid)
-    print(f"Sending initialize RPC as {c_clientid}, to {topic}")
+    log_debug(f"Sending initialize RPC as {c_clientid}, to {topic}")
     initialize_params = {"protocolVersion": PROTOCOL_VERSION,
                          "capabilities": global_client_capabilities,
                          "clientInfo": global_client_info
                          }
-    send_mqtt_json_rpc(client, topic, 
-                       "initialize", initialize_params, 1)
+    send_mqtt_json_rpc(client, topic, METHOD_INIT, initialize_params)
 
 def send_ping_message(client):
     ping_message = json_notification_msg("ping", {"timestamp": now_ms()})
@@ -343,14 +401,14 @@ def pick_mqtt_client_randomly():
 def now_ms():
     return int(time.time() * 1000)
 
-def call_tools(request_id, func, *args, **kwargs):
+def call_tools(func, **kwargs):
     ## call the function and return error if it crashes
     try:
-        result = func(*args, **kwargs)
-        return json_rpc_result_msg({"content": format_result(result)}, request_id)
+        result = func(**kwargs)
+        return ("ok", {"content": format_result(result)})
     except Exception as e:
-        result = {"content": [error_result(str(e))], "isError": True}
-        return json_rpc_result_msg(result, request_id)
+        log_debug(f"Tools call failed: {str(e)}")
+        return ("ok", {"content": [error_result(str(e))], "isError": True})
 
 def format_result(result):
     if isinstance(result, list):
@@ -360,7 +418,7 @@ def format_result(result):
 
 def do_format_result(result):
     if isinstance(result, str):
-        return text_result()
+        return text_result(result)
     elif isinstance(result, dict):
         return json_result(result)
     elif isinstance(result, tuple):
@@ -386,7 +444,24 @@ def image_result(result):
             "mimeType": result["mimeType"]}
 
 def error_result(error_msg):
-    {"type": "text", "text": error_msg}
+    return {"type": "text", "text": error_msg}
+
+def maybe_create_event_loop():
+    try:
+        return asyncio.get_event_loop()
+    except RuntimeError as e:
+        if str(e).startswith('There is no current event loop in thread'):
+            return asyncio.new_event_loop()
+        else:
+            raise
+
+def maybe_decode_json(arguments):
+    if isinstance(arguments, str):
+        try:
+            return json.loads(arguments)
+        except:
+            return arguments
+    return arguments
 
 ################################################################################
 ## MQTT Callbacks
@@ -398,15 +473,16 @@ def on_ping_timer():
     start_ping_timer(userdata["ping_interval"])
 
 def on_message(client, userdata, msg):
-    print(f"Received: {msg.payload}")
     topic_words = msg.topic.split('/')
     if userdata["mcp_role"] == "server":
         handle_message_as_server(client, msg, topic_words, userdata)
     elif userdata["mcp_role"] == "client":
         handle_message_as_client(client, msg, topic_words, userdata)
+    else:
+        log_debug(f"Unknown MCP role: {userdata['mcp_role']}")
 
 def on_connect(client, userdata, flags, reason_code, properties):
-    print(f"Connected with result code {reason_code}")
+    log_debug(f"Connected with result code {reason_code}")
     if userdata["mcp_role"] == "server":
         server_name = userdata["name"]
         client.subscribe(server_rpc_topic_filter(server_name, "#"))
@@ -422,14 +498,14 @@ def handle_message_as_server(client, msg, topic_words, userdata):
     ##  - Topic of RPC messages: $mcp/server_rpc/<server_name>/<clientid_of_mcp_client>
     ##  - Topic of client capability messages: $mcp/client/<client_name>/capability/<capability>
     if topic_words[0] != "$mcp":
-        print(f"Unknown topic {msg.topic}")
+        log_debug(f"Unknown topic {msg.topic}")
         return None
     if topic_words[1] == "server_rpc":
         handle_rpc_message_as_server(client, msg, topic_words, userdata)
     elif topic_words[1] == "client":
         handle_capability_message_as_server(client, msg, topic_words, userdata)
     else:
-        print(f"Unknown topic {msg.topic}")
+        log_debug(f"Unknown topic {msg.topic}")
         return None
 
 def handle_message_as_client(client, msg, topic_words, userdata):
@@ -438,7 +514,7 @@ def handle_message_as_client(client, msg, topic_words, userdata):
     ##  - Topic of server capability messages: $mcp/server/<server_name>/capability/<capability>
     ##  - Topic of server ping messages: $mcp/server/<server_name>/ping
     if topic_words[0] != "$mcp":
-        print(f"Unknown topic {msg.topic}")
+        log_debug(f"Unknown topic {msg.topic}")
         return
     if topic_words[1] == "client_rpc":
         handle_rpc_message_as_client(client, msg, topic_words)
@@ -448,20 +524,45 @@ def handle_message_as_client(client, msg, topic_words, userdata):
         else:
             handle_capability_message_as_client(client, msg, topic_words)
     else:
-        print(f"Unknown topic {msg.topic}")
+        log_debug(f"Unknown topic {msg.topic}")
         return None
 
 def handle_rpc_message_as_client(client, msg, topic_words):
+    pending_requests = client.user_data_get().get("pending_requests", {})
+    payload = json.loads(msg.payload)
+    log_debug(f"Handling RPC message: {payload}")
+    request_id = payload["id"]
+    if request_id in pending_requests:
+        pending_data = pending_requests[request_id]
+        request = pending_data["message"]
+        future = pending_data.get("future", None)
+        method = request["method"]
+        if method == METHOD_INIT:
+            response = handle_initialize_rpc_response(client, payload, topic_words)
+        elif method == METHOD_FUNC_CALL:
+            response = ("ok", payload["result"])
+        else:
+            log_debug(f"Unknown method: {method}")
+            response = ("error", f"Unknown method: {method}")
+
+        ## set the result and remove the pending request
+        if future is not None:
+            future.set_result(response)
+        remove_pending_request(client, request_id)
+    else:
+        log_debug(f"Unknown request id: {request_id}")
+
+def handle_initialize_rpc_response(client, payload, topic_words):
+    log_debug(f"Handling initialize response: {payload}")
     global global_server_capabilities
     global global_server_info
-    payload = json.loads(msg.payload)
-    print(f"Handling RPC message: {payload}")
     server_name = get_server_name_from_rpc_topic(topic_words)
     global_server_capabilities[server_name] = payload["result"]["capabilities"]
     global_server_info[server_name] = payload["result"]["serverInfo"]
+    return ("ok", "initialize response received")
 
 def handle_ping_message_as_client(client, msg, topic_words):
-    print(f"Received ping message: {msg.payload}")
+    log_debug(f"Received ping message: {msg.payload}")
     server_name = topic_words[2]
     if global_server_capabilities.get(server_name) is None:
         payload = json.loads(msg.payload)
@@ -471,7 +572,24 @@ def handle_ping_message_as_client(client, msg, topic_words):
             send_initialize_rpc(server_name)
 
 def handle_capability_message_as_client(client, msg, topic_words):
-    print(f"Received capability message: {msg.payload}")
+    log_debug(f"Received capability message: {msg.payload}")
+
+################################################################################
+## Helper Functions
+################################################################################
+def log_debug(msg):
+    log("DEBUG", msg)
+
+def log_info(msg):
+    log("INFO", msg)
+
+def log_error(msg):
+    log("ERROR", msg)
+
+def log(level, msg):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    level = "DEBUG"
+    print(f"[{timestamp}] [MCP/MQTT] [{level}] - {msg}")
 
 ################################################################################
 ## Main

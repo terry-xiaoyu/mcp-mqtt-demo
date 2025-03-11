@@ -6,6 +6,7 @@ SERVER_NAME = "ssh_tool"
 VERSION = "0.1.0"
 
 def ssh_execute_command(host, port, username, password, command):
+    print(f"------ssh_execute_command host: {host}, port: {port}, username: {username}, password: {password}, command: {command}")
     """
     通过 SSH 连接到远程服务器并执行指定命令。
     
@@ -36,11 +37,11 @@ def ssh_execute_command(host, port, username, password, command):
         return output, error if error else None
 
     except paramiko.AuthenticationException:
-        return "SSH 认证失败，请检查用户名或密码。"
+        return "SSH authentication failed"
     except paramiko.SSHException as e:
-        return f"SSH 连接错误: {str(e)}"
+        return f"SSH error: {str(e)}"
     except Exception as e:
-        return f"未知错误: {str(e)}"
+        return f"unknown error: {str(e)}"
 
 # 示例使用
 if __name__ == "__main__":
@@ -53,9 +54,9 @@ if __name__ == "__main__":
     # print(result)
     supported_tools = [
         {
-            "name": "ssh",
+            "name": "ssh_execute_command",
             "description": "Execute command on remote server via SSH",
-            "inputSchema": {
+            "parameters": {
                 "type": "object",
                 "properties": {
                     "host": {
