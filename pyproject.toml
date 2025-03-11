@@ -8,4 +8,6 @@ dependencies = [
     "openai>=1.65.5",
     "paho-mqtt>=2.1.0",
     "paramiko>=3.5.1",
+    "requests>=2.32.3",
+    "wxpython>=4.2.2",
 ]

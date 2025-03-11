@@ -34,7 +34,10 @@ def ssh_execute_command(host, port, username, password, command):
         error = stderr.read().decode('utf-8').strip()
         
         client.close()
-        return output, error if error else None
+        if error:
+            return error
+        else:
+            return output
 
     except paramiko.AuthenticationException:
         return "SSH authentication failed"

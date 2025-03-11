@@ -6,6 +6,7 @@ import time
 import threading
 import sys
 import asyncio
+import queue
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import MQTTErrorCode, MQTTProtocolVersion
 from enum import Enum
@@ -55,10 +56,11 @@ def run_mcp_server(server_name, version, num_workers = 4, ping_interval=30,
 
 def run_mcp_client(client_name, version, num_workers = 1, ping_interval=30,
                    host="localhost", port=1883, username=None, password=None,
-                   capabilities=[]):
+                   capabilities=[], on_server_capability_change=None):
     global global_client_capabilities
     global global_client_info
-    connect("client", client_name, num_workers, ping_interval, host, port, username, password)
+    metadata = {"on_server_capability_change": on_server_capability_change}
+    connect("client", client_name, num_workers, ping_interval, host, port, username, password, metadata)
     global_client_capabilities[client_name] = capabilities
     global_client_info[client_name] = {"name": client_name, "version": version}
     send_ping_message(pick_mqtt_client_randomly())
@@ -72,23 +74,30 @@ def send_tools_call_rpc(server_name, tool_name, arguments):
     tools_call_params = {"name": tool_name, "arguments": arguments}
     return asyncio.run(send_mqtt_json_rpc_and_wait_reply(client, topic, METHOD_FUNC_CALL, tools_call_params))
 
+def get_tools_by_server_name_open_ai(server_name):
+    return do_get_avaliable_tools_open_ai(server_name, global_server_capabilities.get(server_name, {}))
+
 def get_avaliable_tools_open_ai():
     ## Return tools from all the available server_names in the form of OpenAI
     ## the global_server_capabilities is of the form {server_name: capabilities}
-    ## where the capabilities contains a list of tools in the form of {"tools": [tool1, tool2, ...]}
-    ## where tool1, tool2, ... are of the form {"name": "tool_name", "description": "tool_description", "parameters": {...}}
+    ##  - where the capabilities contains a list of tools in the form of {"tools": [tool1, tool2, ...]}
+    ##  - where tool1, tool2, ... are of the form {"name": "tool_name", "description": "tool_description", "parameters": {...}}
     ## We need to convert it to [{"type": "function", "function": {"name": "server_name:tool_name", "description": "tool_description", "parameters": {...}}}]
     ## Note that we also change the the "name" to "server_name:tool_name"
     tools = []
     for server_name, capabilities in global_server_capabilities.items():
-        for tool in capabilities.get("tools", []):
-            toolc = copy.deepcopy(tool)
-            toolc["name"] = f"{server_name}:{toolc['name']}"
-            tools.append({"type": "function", "function": toolc})
+        do_get_avaliable_tools_open_ai(server_name, capabilities, tools)
+    return tools
+
+def do_get_avaliable_tools_open_ai(server_name, capabilities, tools=[]):
+    for tool in capabilities.get("tools", []):
+        toolc = copy.deepcopy(tool)
+        toolc["name"] = f"{server_name}:{toolc['name']}"
+        tools.append({"type": "function", "function": toolc})
     return tools
 
 def connect(mcp_role, name, num_workers, ping_interval=30,
-            host="localhost", port=1883, username=None, password=None):
+            host="localhost", port=1883, username=None, password=None, metadata={}):
     if mcp_role != "server" and mcp_role != "client":
         raise ValueError("Invalid MCP role")
     if num_workers < 1:
@@ -104,12 +113,11 @@ def connect(mcp_role, name, num_workers, ping_interval=30,
         userdata = {"mcp_role": mcp_role, "name": name, "worker_id": worker_id,
                     "num_workers": num_workers, "ping_interval": ping_interval}
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id = clientid,
-                             userdata = userdata, protocol = MQTTProtocolVersion.MQTTv5)
+                             userdata = {**userdata, **metadata}, protocol = MQTTProtocolVersion.MQTTv5)
         client.username_pw_set(username, password)
         client.on_message = on_message
         client.on_connect = on_connect
-        res = client.connect(host = MQTT_BROKER, port = MQTT_PORT,
-                             keepalive = ping_interval)
+        res = client.connect(host = host, port = port, keepalive = ping_interval)
         if res != MQTTErrorCode.MQTT_ERR_SUCCESS:
             raise ConnectionError(f"Failed to connect to MQTT Broker: {res}")
         log_debug(f"Connected to MQTT Broker, clientid: {clientid}")
@@ -405,10 +413,11 @@ def call_tools(func, **kwargs):
     ## call the function and return error if it crashes
     try:
         result = func(**kwargs)
+        print(f"---Tool call result: {result}")
         return ("ok", {"content": format_result(result)})
     except Exception as e:
         log_debug(f"Tools call failed: {str(e)}")
-        return ("ok", {"content": [error_result(str(e))], "isError": True})
+        return ("error", {"content": [error_result(str(e))], "isError": True})
 
 def format_result(result):
     if isinstance(result, list):
@@ -429,8 +438,10 @@ def do_format_result(result):
             return json_result(result)
         elif res_type == "image":
             return image_result(result)
+        else:
+            return error_result(f"Unsupported result type: {res_type}")
     else:
-        return error_result(f"Invalid result type: {type(result)}")
+        return error_result(f"Invalid result format: {type(result)}")
 
 def text_result(result):
     return {"type": "text", "text": result}
@@ -554,11 +565,9 @@ def handle_rpc_message_as_client(client, msg, topic_words):
 
 def handle_initialize_rpc_response(client, payload, topic_words):
     log_debug(f"Handling initialize response: {payload}")
-    global global_server_capabilities
-    global global_server_info
     server_name = get_server_name_from_rpc_topic(topic_words)
-    global_server_capabilities[server_name] = payload["result"]["capabilities"]
-    global_server_info[server_name] = payload["result"]["serverInfo"]
+    set_global_server_capabilities(client, server_name, payload["result"]["capabilities"],
+                                   payload["result"]["serverInfo"])
     return ("ok", "initialize response received")
 
 def handle_ping_message_as_client(client, msg, topic_words):
@@ -573,6 +582,18 @@ def handle_ping_message_as_client(client, msg, topic_words):
 
 def handle_capability_message_as_client(client, msg, topic_words):
     log_debug(f"Received capability message: {msg.payload}")
+
+def set_global_server_capabilities(client, server_name, server_capabilities, server_info=None):
+    global global_server_capabilities
+    global global_server_info
+    global_server_capabilities[server_name] = server_capabilities
+    if global_server_info is not None:
+        global_server_info[server_name] = server_info
+    on_server_capability_change = client.user_data_get().get("on_server_capability_change", None)
+    if on_server_capability_change is not None:
+        func_name, kwargs = on_server_capability_change
+        kwargs["server_name"] = server_name
+        func_name(**kwargs)
 
 ################################################################################
 ## Helper Functions
